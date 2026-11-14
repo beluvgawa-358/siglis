@@ -8,12 +8,15 @@
 --  getgenv().sigilConfig = {
 --      AutoRun = true, Network = false, ResultGUI = false,
 --      Bootstrap = false, ResourceProbe = false, Quiet = false,
+--      Progress = true, Upload = true,
 --      Debug = { printcheckpoints = true },
 --  }
 --  getgenv().sigil.run() -> results, passed, stats
---  getgenv().sigilResults / sigilStats / sigilPassed / sigilError
+--  getgenv().sigilResults / sigilStats / sigilPassed / sigilError / sigilResultURL
 --
---  No teleport, telemetry or result posting unless you opt in.
+--  No teleport. The suite's own telemetry stays off unless Network = true.
+--  When a run finishes, results are POSTed to the Sigil results page and the
+--  returned link is copied to the clipboard; set Upload = false to keep it local.
 --  The P79 memory probe is off unless ResourceProbe = true.
 -- ============================================================================
 
@@ -6281,6 +6284,38 @@ run_sigil_suite = function(environment, options)
                     (succeeded and output or warning)(specification.test, error_message, elapsed)
                 end
             end
+
+            if options.print_progress then
+                local any_failed, any_passed, any_skipped = false, false, false
+                local detail
+                for _, feature in ipairs(features) do
+                    local result = results_by_name[feature]
+                    if result then
+                        if result.skipped then
+                            any_skipped = true
+                            detail = detail or result.detail
+                        elseif result.passed then
+                            any_passed = true
+                        else
+                            any_failed = true
+                            detail = detail or result.detail
+                        end
+                    end
+                end
+                local icon = "\226\128\162"
+                if any_failed then
+                    icon = "\226\157\140"
+                elseif any_passed then
+                    icon = "\226\156\133"
+                elseif any_skipped then
+                    icon = "\226\143\173\239\184\143"
+                end
+                if detail ~= nil then
+                    output(icon .. " " .. tostring(specification.test) .. " - " .. tostring(detail))
+                else
+                    output(icon .. " " .. tostring(specification.test))
+                end
+            end
         end
     end
     execute_test_plan(TEST_PLAN, selected_set, {
@@ -6439,6 +6474,11 @@ end
 --    4. Two upstream helpers that declared unused leading parameters
 --       (compare_test_results, round_result_value) were corrected so sorting
 --       results and the final elapsed-time line cannot throw.
+--    5. Each test prints a status icon when it finishes: ✅ passed,
+--       ⏭️ skipped, ❌ failed.
+--    6. When a run finishes, results are POSTed to the Sigil results page and
+--       the returned link is copied to your clipboard. Set Upload = false to
+--       keep everything local.
 --
 --  getgenv().sigilConfig = {
 --      AutoRun = true,          -- run on load; false = library only
@@ -6447,7 +6487,8 @@ end
 --      Bootstrap = false,       -- original upstream flow (WILL teleport)
 --      ResourceProbe = false,   -- P79 1 GiB allocation loop (dangerous)
 --      Quiet = false,           -- suppress the one-line banner
---      Progress = true,         -- print each test name as it starts
+--      Progress = true,         -- print each test name and status icon
+--      Upload = true,           -- POST results + copy the link to clipboard
 --      Debug = { printcheckpoints = true },
 --  }
 --
@@ -6457,6 +6498,7 @@ end
 --  getgenv().sigilStats          -> last run's counters
 --  getgenv().sigilPassed         -> last run's boolean
 --  getgenv().sigilError          -> last auto-run error, if any
+--  getgenv().sigilResultURL      -> link from the last upload
 -- ============================================================================
 
 local sigilEnv = (getgenv and getgenv()) or _G
@@ -6503,15 +6545,159 @@ local function sigilStore(results, passed, stats)
     end
 end
 
+local SIGIL_UPLOAD_URL = "https://sigil-extension-forge.lovable.app/api/public/submit"
+local SIGIL_UPLOAD_KEY = "UAccrOoLl6foNOX7esAaW8d2l52cznK8nL2VnCeZjtBkgzR0"
+local SIGIL_VERSION = "1.0.0"
+
+local function sigilWarn(message)
+    local warn_fn = sigilEnv.warn or rawget(_G, "warn") or sigilEnv.print or print
+    warn_fn(message)
+end
+
+local function sigilPrint(message)
+    (sigilEnv.print or print)(message)
+end
+
+local function sigilHttpService()
+    local ok, service = pcall(function()
+        return sigilEnv.game:GetService("HttpService")
+    end)
+    if ok then return service end
+    return sigilEnv.HttpService
+end
+
+local function sigilJsonEncode(value)
+    local service = sigilHttpService()
+    if service and type(service.JSONEncode) == "function" then
+        local ok, encoded = pcall(function() return service:JSONEncode(value) end)
+        if ok then return encoded end
+    end
+    return nil
+end
+
+local function sigilJsonDecode(text)
+    local service = sigilHttpService()
+    if service and type(service.JSONDecode) == "function" then
+        local ok, decoded = pcall(function() return service:JSONDecode(text) end)
+        if ok then return decoded end
+    end
+    return nil
+end
+
+local function sigilRequestFunction()
+    local fn = sigilEnv.request
+    if type(fn) == "function" then return fn end
+    local syn_lib = sigilEnv.syn or rawget(_G, "syn")
+    if type(syn_lib) == "table" and type(syn_lib.request) == "function" then return syn_lib.request end
+    local http_lib = sigilEnv.http or rawget(_G, "http")
+    if type(http_lib) == "table" and type(http_lib.request) == "function" then return http_lib.request end
+    fn = sigilEnv.http_request or rawget(_G, "http_request")
+    if type(fn) == "function" then return fn end
+    return nil
+end
+
+local function sigilIdentify()
+    local fn = sigilEnv.identifyexecutor or rawget(_G, "identifyexecutor")
+    if type(fn) ~= "function" then return "Unknown" end
+    local ok, name, version = pcall(fn)
+    if not ok or not name then return "Unknown" end
+    if version then return tostring(name) .. "/" .. tostring(version) end
+    return tostring(name)
+end
+
+local function sigilCollectStatus(results)
+    local passed, failed, skipped = {}, {}, {}
+    for _, result in ipairs(results or {}) do
+        local name = result.test or result.name
+        if name ~= nil then
+            if result.skipped then
+                skipped[#skipped + 1] = tostring(name)
+            elseif result.passed then
+                passed[#passed + 1] = tostring(name)
+            else
+                failed[#failed + 1] = tostring(name)
+            end
+        end
+    end
+    return passed, failed, skipped
+end
+
+local function sigilUpload(results, stats)
+    local request_fn = sigilRequestFunction()
+    if not request_fn then
+        sigilWarn("[sigil] upload skipped: executor has no request function")
+        return nil
+    end
+
+    local passed, failed, skipped = sigilCollectStatus(results)
+    local body = sigilJsonEncode({
+        executor = sigilIdentify(),
+        version = SIGIL_VERSION,
+        timeTaken = stats and stats.elapsed_seconds or 0,
+        passed = passed,
+        failed = failed,
+        skipped = skipped,
+    })
+    if not body then
+        sigilWarn("[sigil] upload skipped: could not encode results")
+        return nil
+    end
+
+    local ok, response = pcall(request_fn, {
+        Url = SIGIL_UPLOAD_URL,
+        Method = "POST",
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["x-api-key"] = SIGIL_UPLOAD_KEY,
+        },
+        Body = body,
+    })
+    if not ok or type(response) ~= "table" then
+        sigilWarn("[sigil] upload failed: " .. tostring(response))
+        return nil
+    end
+
+    local decoded = sigilJsonDecode(response.Body)
+    if type(decoded) ~= "table" or decoded.url == nil then
+        sigilWarn("[sigil] upload failed: " .. tostring(response.Body))
+        return nil
+    end
+
+    local url = tostring(decoded.url)
+    sigilEnv.sigilResultURL = url
+    if type(sigilEnv.sigil) == "table" then
+        sigilEnv.sigil.resultURL = url
+    end
+
+    local clipboard = sigilEnv.setclipboard or rawget(_G, "setclipboard")
+    if type(clipboard) == "function" then
+        local copied = pcall(clipboard, url)
+        if copied then
+            sigilPrint("[sigil] result link copied to clipboard: " .. url)
+        else
+            sigilPrint("[sigil] result link: " .. url)
+        end
+    else
+        sigilPrint("[sigil] result link: " .. url)
+    end
+    return url
+end
+
 local function sigilRun(overrides)
     sigilEnv.sigilError = nil
     local results, passed, stats = run_sigil_suite(sigilEnv, sigilOptions(overrides))
     sigilStore(results, passed, stats)
     if stats ~= nil and sigilConfig.Quiet ~= true then
-        (sigilEnv.print or print)(string.format(
+        sigilPrint(string.format(
             "[sigil] done: %d passed, %d failed, %d skipped (%d evaluated)",
             stats.passed or 0, stats.failed or 0, stats.skipped or 0, stats.total or 0
         ))
+    end
+    local upload = overrides and overrides.upload
+    if upload == nil then upload = sigilConfig.Upload ~= false end
+    if upload == true then
+        local ok, err = pcall(sigilUpload, results, stats)
+        if not ok then sigilWarn("[sigil] upload failed: " .. tostring(err)) end
     end
     return results, passed, stats
 end
@@ -6526,6 +6712,7 @@ sigilEnv.sigil = {
     results = nil,
     stats = nil,
     passed = nil,
+    resultURL = nil,
 }
 sigilEnv.sigilRun = sigilRun
 
